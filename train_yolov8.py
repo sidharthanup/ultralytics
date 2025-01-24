@@ -1,9 +1,12 @@
 from ultralytics import YOLO
-#from wandb.integration.yolov8 import add_callbacks as add_wandb_callbacks
+import wandb
+from wandb.integration.ultralytics import add_wandb_callback
 
 
-model = YOLO("yolov8m.yaml")
-#add_wandb_callbacks(model, project = "INat-yolov8")
+model = YOLO("yolov8m.pt")
+add_wandb_callback(model, enable_model_checkpointing=False)
 
+results = model.train(project = "INat-yolov8", data = "../custom_dataset2.yaml",epochs = 100, batch = 20, save_period = 10, imgsz=600, device="0")
 
-results = model.train(data = "../custom_dataset.yaml",epochs = 2, save_period = 10)
+# Finish the W&B run
+wandb.finish()

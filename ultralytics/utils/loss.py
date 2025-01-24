@@ -197,11 +197,16 @@ class v8DetectionLoss:
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        #print("pred shape during loss:", preds.shape)
         feats = preds[1] if isinstance(preds, tuple) else preds
+        # print("printing all xi shapes:")
+        # for xi in feats:
+        #     print(xi.shape)
+        #     print(xi.view(feats[0].shape[0], self.no, -1))
+        
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
         )
-
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
 
@@ -227,12 +232,37 @@ class v8DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
-
+        target_scores = target_scores[:, :, 13:5102]
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # Cls loss with hierarchical probabilities
+        # Define the number of superclasses and species in each superclass
+        superclass_count = 13
+        species_group_sizes = [53, 115, 77, 56, 964, 9, 121, 1021, 186, 93, 2101, 4, 289]
+
+        # Step 1: Extract superclass and species logits
+        superclass_logits = pred_scores[:, :, :superclass_count]  # Shape: (batch_size, num_anchors, 13)
+        superclass_probs = superclass_logits.softmax(dim=-1)  # Superclass probabilities
+
+        # Step 2: Calculate joint probabilities for species within each superclass
+        species_probs = []
+        start_index = superclass_count
+        for i, group_size in enumerate(species_group_sizes):
+            # Extract logits for the species within the current superclass
+            species_logits = pred_scores[:, :, start_index:start_index + group_size]
+            # Normalize with softmax to get species probabilities within the superclass
+            species_conditional_probs = species_logits.softmax(dim=-1)  # Shape: (batch_size, num_anchors, group_size)
+            # Calculate joint probability by multiplying with superclass probability
+            joint_species_probs = superclass_probs[:, :, i].unsqueeze(-1) * species_conditional_probs
+            species_probs.append(joint_species_probs)
+            start_index += group_size
+
+        # Concatenate all species probabilities to form the hierarchical probability structure
+        all_species_probs = torch.cat(species_probs, dim=-1)  # Shape: (batch_size, num_anchors, total_species_count)
+
+
+        # Calculate BCE loss using hierarchical probabilities
+        loss[1] = self.bce(all_species_probs, target_scores.to(dtype)).sum() / target_scores_sum  # BCE with hierarchical probs
 
         # Bbox loss
         if fg_mask.sum():

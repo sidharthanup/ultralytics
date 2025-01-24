@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.modules import (
     AIFI,
@@ -108,32 +109,71 @@ class BaseModel(nn.Module):
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """
-        Perform a forward pass through the network.
+        Perform a forward pass through the network with hierarchical normalization.
 
         Args:
             x (torch.Tensor): The input tensor to the model.
-            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            profile (bool): Print the computation time of each layer if True, defaults to False.
             visualize (bool): Save the feature maps of the model if True, defaults to False.
             embed (list, optional): A list of feature vectors/embeddings to return.
 
         Returns:
-            (torch.Tensor): The last output of the model.
+            (torch.Tensor): The output of the model with hierarchical probabilities.
         """
         y, dt, embeddings = [], [], []  # outputs
+        count = 0
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
+            
+            # Forward pass through layer
+            x = m(x)
+            print("This is x:")
+            print(count)
+            
+            if count == 22:
+                print(x[0].shape)
+                print(x[1].shape)
+                print(x[2].shape)
+            count += 1
+            # Apply hierarchical normalization in the last layer
+            if m == self.model[-1]:  # If this is the final detection layer
+                batch_size = x[2].size(0)
+
+                # Step 1: Compute superclass probabilities (first 13 logits)
+                filler = x[2][:, :64, :]
+                superclass_logits = x[2][:, 64:64+13, :]
+                superclass_probs = F.softmax(superclass_logits, dim=1)  # Shape: (batch_size, 13)
+
+                # Step 2: Compute species probabilities within each superclass
+                species_group_sizes = [53, 115, 77, 56, 964, 9, 121, 1021, 186, 93, 2101, 4, 289]
+                species_probs = []
+
+                start_index = 64+13
+                for i, group_size in enumerate(species_group_sizes):
+                    # Extract logits for the species within the current superclass
+                    species_logits = x[2][:, start_index:start_index + group_size, :]
+                    # Normalize these logits with softmax to get species probabilities within the superclass
+                    species_conditional_probs = F.softmax(species_logits, dim=1)
+                    # Multiply by the superclass probability to get joint probabilities
+                    joint_species_probs = superclass_probs[:, i].unsqueeze(1) * species_conditional_probs
+                    species_probs.append(joint_species_probs)
+                    start_index += group_size
+
+                # Step 3: Concatenate all species probabilities to form the final output
+                all_species_probs = torch.cat(species_probs, dim=1)  # Shape: (batch_size, total_species_count)
+                x[2] = torch.cat([filler, superclass_probs, all_species_probs], dim=1)  # Shape: (batch_size, total_classes)
+                #print("Let's see what x[2] is:", x[2].shape)
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if embed and m.i in embed:
-                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                embeddings.append(F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
-        return x
+        return x  # Return the output with hierarchical probabilities
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -305,6 +345,36 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
+
+    # def forward(self, x):
+    #     """Compute the forward pass with hierarchical group-wise logits."""
+    #     logits = self.model(x)  # Original forward computation to get raw logits
+    #     batch_size = logits.size(0)
+
+    #     # Step 1: Compute superclass probabilities (first 13 logits)
+    #     superclass_logits = logits[:, :13]
+    #     superclass_probs = F.softmax(superclass_logits, dim=1)  # Shape: (batch_size, 13)
+
+    #     # Step 2: Compute species probabilities within each superclass
+    #     species_group_sizes = [53, 115, 77, 56, 964, 9, 121, 1021, 186, 93, 2101, 4, 289]
+    #     species_probs = []
+
+    #     start_index = 13
+    #     for i, group_size in enumerate(species_group_sizes):
+    #         # Extract logits for the species within the current superclass
+    #         species_logits = logits[:, start_index:start_index + group_size]
+    #         # Normalize these logits with softmax to get species probabilities within the superclass
+    #         species_conditional_probs = F.softmax(species_logits, dim=1)
+    #         # Multiply by the superclass probability to get joint probabilities
+    #         joint_species_probs = superclass_probs[:, i].unsqueeze(1) * species_conditional_probs
+    #         species_probs.append(joint_species_probs)
+    #         start_index += group_size
+
+    #     # Step 3: Concatenate all species probabilities and return the hierarchical structure
+    #     all_species_probs = torch.cat(species_probs, dim=1)  # Shape: (batch_size, total_species_count)
+    #     output_probs = torch.cat([superclass_probs, all_species_probs], dim=1)  # Shape: (batch_size, total_classes)
+
+    #     return output_probs  # Return hierarchical probabilities instead of raw logits
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference and train outputs."""
